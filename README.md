@@ -207,9 +207,180 @@ User query
 
 ## Tech Stack 
 
+| Layer | Choices |
+|-------|---------|
+| **Backend** | Java 21, Spring Boot 3, Spring Cloud (Config, Gateway, OpenFeign where needed), Maven |
+| **Frontend** | TypeScript, React 18, Vite |
+| **API** | REST + SSE streaming |
+| **RDBMS** | PostgreSQL (Phase 1) → DynamoDB for selected aggregates (Phase 2) |
+| **Vector / search** | pgvector / OpenSearch → **Amazon OpenSearch Service** |
+| **Cache / limits** | Redis |
+| **Messaging** | **Apache Kafka** (local MSK-compatible) → MSK or SQS |
+| **Object storage** | S3 API (MinIO dev → **S3**) |
+| **Auth** | **Spring Security** + OAuth2 Resource Server / OIDC |
+| **Context & tracing** | **OpenTelemetry** (replaces thread-local propagation wrappers); W3C trace context |
+| **Metrics** | Micrometer → Prometheus; CloudWatch in AWS |
+| **MCP** | Official MCP SDK / HTTP transport |
+| **Containers** | Docker, multi-stage builds |
+| **Orchestration** | **Kubernetes**, **Helm**, HPA, optional **Istio** service mesh |
+| **IaC** | Terraform or AWS CDK (EKS, MSK, OpenSearch, RDS where used) |
+| **CI/CD** | **GitHub Actions** + **Jenkins**; image scan; Helm deploy to EKS |
+| **Testing** | JUnit 5, Mockito, **Testcontainers**, Cucumber **BDD**, contract tests for APIs |
+
+**Explicitly not used:** Alibaba TTL, Dubbo, RocketMQ, domestic-only auth SDKs, or region-specific LLM gateways as defaults.
+
+
+---
+
+## Engineering Practices 
+
+### Test Pyramid 
+
+| Level | Tooling | Scope |
+|-------|---------|--------|
+| **Unit (TDD)** | JUnit 5, Mockito | Retrieval merge, circuit breaker, intent scoring, chunking |
+| **Integration** | Testcontainers (Postgres, Redis, Kafka) | Repository, pipeline nodes, Kafka consumers |
+| **BDD** | Cucumber + Gherkin | End-to-end: “user asks → retrieval → streamed answer”; admin flows |
+| **Contract** | Spring Cloud Contract / REST Assured | API stability between `frontend` and `bootstrap` |
+| **Load** | k6 or Gatling (optional stage) | Retrieval latency, SSE concurrency |
+
+
+### Git pipeline (Jenkins)
+
+Typical multibranch pipeline stages: 
+
+- **Checkout** -- Shallow clone, commit metadata for traceability 
+- **Build** -- `mvn -B verify` (backend), `npm ci && npm run build` (frontend)
+- **Unit + integration test** -- Fail fast; JaCoco coverage gate (threshold configurable)
+- **BDD** -- Cucumber reports archived as Jenkins artifacts 
+- **Static analysis** -- SpotBugs, Checkstyle, npm audit, Trivy image scan 
+- **Package** -- Docker images tagged `git sha` -> push to **ECR** 
+- **Deploy** -- Helm upgrade to dev/stagging/prod EKS; smock tests via kubectl / HTTP checks
+- **Observability check** -- Verify OTLP export and synthetic trace in stagging
 
 
 
+GitHub Actions can mirror the same stages for PR validation; Jenkins remains the **release** orchestrator for promoted environments. 
+
+
+### Configuration 
+
+- **Spring Cloud Config** (Git-backed or AWS Parameter Store) for environment-specific LLM keys, Kafka brokers, and feature flags. 
+
+- **Secrets** -- Kubernetes Secrets + External Secrets Operator; never commit credentials
+
+
+---
+
+## Deployment 
+
+### Local (Docker Compose)
+
+```bash 
+# Infrastructure only (example layout under resources/docker)
+docker compose -f resources/docker/lightweight/docker-compose.yml up -d 
+
+# Backend 
+./mvnw -pl bootstrap -am spring-boot:run 
+
+# Frontend 
+cd frontend && npm install && npm run dev 
+```
+
+### Kubernetes (production-shaped)
+
+```bash 
+# Build images 
+docker build -t ai-rag-engine/api:latest -f bootstrap/Dockerfile . 
+docker build -t ai-rag-engine/mcp:latest -f mcp-server/Dockerfile . 
+
+
+# Helm (charts to be added under deploy/helm)
+helm upgrade --install ai-rag-engine ./deploy/helm/ai-rag-engine \
+  --namespace ai-rag --create-namespace \
+  -f deploy/helm/values-staging.yaml 
+```
+
+
+**Operational checklist** 
+
+- Liveness/readiness probes on API and MCP 
+- HPA on CPU + custom metric (e.g., in-flight RAG requests)
+- PodDisruptionBudgets for API tier 
+- Kafka consumer lag alerts 
+- OpenTelemetry Collector DaemonSet or sidecar 
+- Backup policies for Postgres / OpenSearch snapshots 
 
 
 
+--- 
+
+## Quick Start 
+
+**Prerequisites:** JDK 21, Maven 3.9_, Node 20+, Docker, Kafka + Redis + PostgreSQL running locally 
+
+
+1. Clone the repository and copy environment templates (when provided under `resources/config`).  
+2. Start dependencies via Compose or your local Kafka/Redis/Postgres install.  
+3. Configure LLM provider keys in Spring config (OpenAI, Bedrock, or Ollama).  
+4. Run the API and open the React app.  
+5. Send a chat request to `/api/ragent/rag/v3/chat` (exact path may vary during refactor).  
+6. Open **Admin → Trace** to inspect the RAG span tree.
+
+---
+
+## Extension Points
+
+| Add… | Implement | Registration |
+|------|-----------|--------------|
+| Search channel | `SearchChannel` | Spring `@Component` |
+| Post-processor | `SearchResultPostProcessor` | Ordered chain bean |
+| Ingestion stage | `IngestionNode` | Pipeline configuration |
+| LLM provider | `ChatClient` in `infra-ai` | Candidate list in config |
+| MCP tool | `MCPToolExecutor` | `DefaultMCPToolRegistry` discovery |
+
+Design patterns used intentionally: **Strategy** (channels), **Chain of Responsibility** (post-processors, model fallback), **Template Method** (ingestion nodes), **Decorator** (stream probe buffer), **Registry** (MCP tools), **AOP** (trace and rate-limit aspects).
+
+---
+
+## Comparison
+
+| Dimension | Typical tutorial RAG | AI RAG Engine |
+|-----------|----------------------|---------------|
+| Retrieval | Single vector search | Multi-channel parallel + post-processing |
+| Queries | Raw user text | Rewrite, decompose, context fill |
+| Intent | None | Tree + clarification |
+| Models | Single endpoint | Routed candidates + circuit breaker + first-packet probe |
+| Memory | Full history in prompt | Window + summarization |
+| Ingestion | Ad-hoc scripts | Configurable pipeline + audit |
+| Observability | Logs only | OpenTelemetry traces + admin trace UI |
+| Tools | None | MCP |
+| Delivery | Manual run | Docker, Helm, EKS, Jenkins/Git CI |
+
+---
+
+## Contributing
+
+1. Fork and create a feature branch from `main`.  
+2. Add or update **unit tests** (TDD) for logic changes; add **Cucumber** scenarios for user-visible behavior.  
+3. Ensure `mvn verify` and frontend build pass locally.  
+4. Open a PR with a clear description, screenshots for UI changes, and trace screenshots for RAG behavior changes.  
+5. Follow [Conventional Commits](https://www.conventionalcommits.org/) for changelog-friendly history.
+
+---
+
+## License
+
+Apache License 2.0 — see [LICENSE](../../LICENSE).
+
+---
+
+## Acknowledgments
+
+Architecture and domain modeling are inspired by the excellent open-source **[nageoffer/ragent](https://github.com/nageoffer/ragent)** project. This repository is an independent **cloud-native refactor** with different operational defaults (Kafka, Spring Cloud, OpenTelemetry, OAuth2, AWS, Kubernetes, Jenkins). Upstream is not affiliated with this fork.
+
+---
+
+<p align="center">
+  <strong>AI RAG Engine</strong> — production-shaped agentic RAG, built for global cloud standards.
+</p>
